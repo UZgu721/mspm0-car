@@ -36,6 +36,9 @@
 #include "encoder.h"
 #include "pid.h"
 #include "huidu.h"
+#include "icm42688.h"
+#include "imu.h"
+#include "ahrs.h"
 #include "adc_dma.h"
 
 uint8_t i = 0;
@@ -44,6 +47,8 @@ int32_t vel_left = 0, vel_right = 0;
 uint8_t time_40ms = 0;
 extern PID_t motorA, motorB;
 uint8_t pid_flag = 0, huidu_pid_flag = 0;
+volatile uint32_t sys_10ms_tick = 0;  /* 10ms 定时器计数 */
+volatile uint8_t  icm_ok       = 0;  /* ICM42688 就绪标志（ISR访问） */
 extern uint8_t turn_count;
 extern uint8_t lap_count;
 extern uint8_t target_lap;
@@ -77,6 +82,20 @@ int main(void)
             continue;
         }
 
+        /* ICM42688 初始化（仅尝试一次，失败则跳过） */
+        {
+            static uint8_t icm_attempted = 0;
+            if (!icm_attempted) {
+                icm_attempted = 1;
+                memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
+                OLED_ShowString(20, 24, (uint8_t *)"IMU CAL...");
+                OLED_Refresh_Gram();
+                icm_ok = IMU_InitAndCalibrate();
+                if (icm_ok) {
+                    AHRS_Init(0.0f, 0.0f);
+                }
+            }
+
         /* 灰度传感器持续采集（ADC+DMA，在后台更新） */
         Huidu_Sensor_Task();
 
@@ -99,6 +118,25 @@ int main(void)
             OLED_ShowString(0, 16, buf);
         }
 
+        /* 第3行：互补滤波 Yaw */
+        if (icm_ok) {
+            static uint32_t last_tick = 0;
+            uint32_t now = sys_10ms_tick;
+            int32_t diff = (int32_t)(now - last_tick);
+            if (diff > 0) {
+                if (diff > 5) diff = 5;
+                IMU_Update((float)diff * 0.01f, huidu_pid_flag == 0U);
+                last_tick = now;
+            }
+        }
+        if (icm_ok) {
+            OLED_ShowString(0, 32, (uint8_t *)"YAW:");
+            OLED_ShowSignedNum(30, 32, (int32_t)AHRS_GetYaw(), 5, 12);
+        } else {
+            OLED_ShowString(0, 32, (uint8_t *)"YAW:---");
+        }
+        }  /* end of icm_ok/icm_attempted static block */
+
         /* 第4行：目标圈数 */
         OLED_ShowString(0, 48, (uint8_t *)"LAP:");
         OLED_ShowNumber(30, 48, target_lap, 2, 12);
@@ -111,6 +149,8 @@ int main(void)
 void TIMG0_IRQHandler(void)
 {
     if (DL_TimerG_getPendingInterrupt(TIMER_0_INST) == DL_TIMER_IIDX_LOAD) {
+
+        sys_10ms_tick++;
 
         vel_left  = Get_encoder_left();
         vel_right = Get_encoder_right();
