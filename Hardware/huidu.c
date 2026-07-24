@@ -4,7 +4,7 @@
 #include "KEY.h"
 #include "graysensor.h"
 
-int huidu_Speed = 375;          // 巡线基础速度
+int huidu_Speed = 300;          // 巡线基础速度
 extern PID_t motorA;
 extern PID_t motorB;
 uint8_t turn_count  = 0;        // 转弯计数，每转一次+1
@@ -143,9 +143,8 @@ void HuiDu_PID(void)
     /* ── 状态0: 直行巡线 + 路口检测 ── */
     if (turn_flag == 0) {
             uint8_t s = Read_HuiDu() & 0x07;
-            uint8_t cnt = (s & 1) + ((s >> 1) & 1) + ((s >> 2) & 1);
-            if (cnt >= 2) {
-                turn_flag   = 1;       /* 左三路中任意两路黑，立即触发转弯 */
+            if (s == 0x07) {
+                turn_flag   = 1;       /* 左三路全黑，立即触发转弯 */
                time_1s_go  = 0;
                 time_1s_turn = 0;
             }
@@ -189,8 +188,8 @@ void HuiDu_PID(void)
     } else if (turn_flag == 1) {
         if (time_1s_go <= 90) {
             time_1s_go++;
-            Motor_SetSpeed(1, 200);
-            Motor_SetSpeed(2, 200);
+            Motor_SetSpeed(1, 300);
+            Motor_SetSpeed(2, 300);
         } else {
             if (time_1s_turn <= 200) {
                 time_1s_turn++;

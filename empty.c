@@ -36,6 +36,9 @@
 #include "encoder.h"
 #include "pid.h"
 #include "huidu.h"
+#include "icm42688.h"
+#include "imu.h"
+#include "ahrs.h"
 #include "adc_dma.h"
 
 uint8_t i = 0;
@@ -44,9 +47,67 @@ int32_t vel_left = 0, vel_right = 0;
 uint8_t time_40ms = 0;
 extern PID_t motorA, motorB;
 uint8_t pid_flag = 0, huidu_pid_flag = 0;
+volatile uint32_t sys_10ms_tick = 0;  /* 10ms 定时器计数 */
+volatile uint8_t  icm_ok       = 0;  /* ICM42688 就绪标志（ISR访问） */
+volatile uint8_t  oled_debug_page = 0;
 extern uint8_t turn_count;
 extern uint8_t lap_count;
 extern uint8_t target_lap;
+
+static void OLED_ShowFixed(uint8_t x, uint8_t y, float value,
+                           uint8_t integer_digits, uint8_t fraction_digits)
+{
+    char text[14];
+    uint32_t scale = 1U;
+    uint32_t whole_limit = 1U;
+    uint32_t magnitude;
+    uint32_t divisor;
+    uint8_t index = 0U;
+    uint8_t i;
+
+    for (i = 0U; i < fraction_digits; ++i) scale *= 10U;
+    for (i = 0U; i < integer_digits; ++i) whole_limit *= 10U;
+
+    text[index++] = (value < 0.0f) ? '-' : '+';
+    magnitude = (uint32_t)((value < 0.0f ? -value : value) * (float)scale + 0.5f);
+    if (magnitude >= whole_limit * scale) magnitude = whole_limit * scale - 1U;
+
+    divisor = scale * (whole_limit / 10U);
+    for (i = 0U; i < integer_digits; ++i) {
+        text[index++] = (char)('0' + (magnitude / divisor) % 10U);
+        divisor /= 10U;
+    }
+    if (fraction_digits != 0U) {
+        text[index++] = '.';
+        divisor = scale / 10U;
+        for (i = 0U; i < fraction_digits; ++i) {
+            text[index++] = (char)('0' + (magnitude / divisor) % 10U);
+            divisor /= 10U;
+        }
+    }
+    text[index] = '\0';
+    OLED_ShowString(x, y, (uint8_t *)text);
+}
+
+static void OLED_DrawDebugPage(void)
+{
+    memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
+    OLED_ShowString(0, 0, (uint8_t *)"Y:");
+    OLED_ShowFixed(16, 0, AHRS_GetYaw(), 3U, 1U);
+
+    OLED_ShowString(0, 16, (uint8_t *)"GZ:");
+    OLED_ShowFixed(24, 16, IMU_GetGyroZ(), 1U, 2U);
+    OLED_ShowString(72, 16, (uint8_t *)"B:");
+    OLED_ShowFixed(88, 16, IMU_GetGyroZBias(), 1U, 2U);
+
+    OLED_ShowString(0, 32, (uint8_t *)"DT:");
+    OLED_ShowNumber(24, 32, IMU_GetLastDtMs(), 3, 12);
+    OLED_ShowString(48, 32, (uint8_t *)"CAL:");
+    OLED_ShowString(80, 32, (uint8_t *)(IMU_IsCalibrated() ? "OK" : "--"));
+
+    OLED_ShowString(0, 48, (uint8_t *)"LATE:");
+    OLED_ShowNumber(40, 48, IMU_GetLateUpdateCount(), 3, 12);
+}
 
 int main(void)
 {
@@ -77,8 +138,33 @@ int main(void)
             continue;
         }
 
+        /* ICM42688 初始化（仅尝试一次，失败则跳过） */
+        {
+            static uint8_t icm_attempted = 0;
+            if (!icm_attempted) {
+                icm_attempted = 1;
+                memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
+                OLED_ShowString(20, 24, (uint8_t *)"IMU CAL...");
+                OLED_Refresh_Gram();
+                icm_ok = IMU_InitAndCalibrate();
+                if (icm_ok) {
+                    AHRS_Init(0.0f, 0.0f);
+                }
+            }
+
         /* 灰度传感器持续采集（ADC+DMA，在后台更新） */
         Huidu_Sensor_Task();
+
+        /* IMU has priority over all OLED drawing. */
+        if (icm_ok) {
+            static uint32_t last_tick = 0U;
+            uint32_t now = sys_10ms_tick;
+            int32_t diff = (int32_t)(now - last_tick);
+            if (diff > 0) {
+                IMU_Update((float)diff * 0.01f, huidu_pid_flag == 0U);
+                last_tick = now;
+            }
+        }
 
         memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
 
@@ -99,11 +185,31 @@ int main(void)
             OLED_ShowString(0, 16, buf);
         }
 
+        /* 第3行：互补滤波 Yaw */
+        if (icm_ok) {
+            OLED_ShowString(0, 32, (uint8_t *)"YAW:");
+            OLED_ShowSignedNum(30, 32, (int32_t)AHRS_GetYaw(), 5, 12);
+        } else {
+            OLED_ShowString(0, 32, (uint8_t *)"YAW:---");
+        }
+        }  /* end of icm_ok/icm_attempted static block */
+
         /* 第4行：目标圈数 */
         OLED_ShowString(0, 48, (uint8_t *)"LAP:");
         OLED_ShowNumber(30, 48, target_lap, 2, 12);
 
-        OLED_Refresh_Gram();
+        if (oled_debug_page != 0U) {
+            OLED_DrawDebugPage();
+        }
+
+        {
+            static uint32_t last_oled_tick = 0U;
+            uint32_t now = sys_10ms_tick;
+            if ((uint32_t)(now - last_oled_tick) >= 10U) {
+                last_oled_tick = now;
+                OLED_Refresh_Gram();
+            }
+        }
     }
 }
 
@@ -111,6 +217,8 @@ int main(void)
 void TIMG0_IRQHandler(void)
 {
     if (DL_TimerG_getPendingInterrupt(TIMER_0_INST) == DL_TIMER_IIDX_LOAD) {
+
+        sys_10ms_tick++;
 
         vel_left  = Get_encoder_left();
         vel_right = Get_encoder_right();
@@ -130,6 +238,10 @@ void TIMG0_IRQHandler(void)
         if (bkeys[1].long_flag == 1) {
             huidu_pid_flag = 1;
             bkeys[1].long_flag = 0;
+        }
+        if (bkeys[1].double_flag == 1) {
+            oled_debug_page ^= 1U;
+            bkeys[1].double_flag = 0;
         }
     }
 }
