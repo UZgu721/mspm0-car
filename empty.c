@@ -30,13 +30,13 @@
  * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #include "board.h"
+#include "icm42688.h"
 #include "ti_msp_dl_config.h"
 #include "KEY.h"
 #include "motor.h"
 #include "encoder.h"
 #include "pid.h"
 #include "huidu.h"
-#include "icm42688.h"
 #include "imu.h"
 #include "ahrs.h"
 #include "adc_dma.h"
@@ -48,7 +48,7 @@ uint8_t time_40ms = 0;
 extern PID_t motorA, motorB;
 uint8_t pid_flag = 0, huidu_pid_flag = 0;
 volatile uint32_t sys_10ms_tick = 0;  /* 10ms 定时器计数 */
-volatile uint8_t  icm_ok       = 0;  /* ICM42688 就绪标志（ISR访问） */
+volatile uint8_t  bmi_ok       = 0;  /* BMI088 就绪标志（ISR访问） */
 volatile uint8_t  oled_debug_page = 0;
 extern uint8_t turn_count;
 extern uint8_t lap_count;
@@ -105,13 +105,18 @@ static void OLED_DrawDebugPage(void)
     OLED_ShowString(48, 32, (uint8_t *)"CAL:");
     OLED_ShowString(80, 32, (uint8_t *)(IMU_IsCalibrated() ? "OK" : "--"));
 
-    OLED_ShowString(0, 48, (uint8_t *)"LATE:");
-    OLED_ShowNumber(40, 48, IMU_GetLateUpdateCount(), 3, 12);
+    OLED_ShowString(0, 48, (uint8_t *)"RD:");
+    OLED_ShowNumber(24, 48, BMI088_GetGyroReadTimeUs(), 4, 12);
+    OLED_ShowString(48, 48, (uint8_t *)"us");
 }
 
 int main(void)
 {
     SYSCFG_DL_init();
+
+    /* Wait for external modules and their I2C supply rails to stabilize. */
+    delay_ms(5000U);
+
     Encoder_Init();
 
     /* 灰度传感器校准初始化 */
@@ -138,17 +143,41 @@ int main(void)
             continue;
         }
 
-        /* ICM42688 初始化（仅尝试一次，失败则跳过） */
+        /* BMI088 初始化（仅尝试一次，失败则跳过） */
         {
-            static uint8_t icm_attempted = 0;
-            if (!icm_attempted) {
-                icm_attempted = 1;
-                memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
-                OLED_ShowString(20, 24, (uint8_t *)"IMU CAL...");
-                OLED_Refresh_Gram();
-                icm_ok = IMU_InitAndCalibrate();
-                if (icm_ok) {
+            static uint8_t bmi_attempted = 0U;
+            static uint8_t bmi_scan_done = 0U;
+            static uint8_t bmi_scan_count = 0U;
+            static uint8_t bmi_scan_addresses[3] = {0U, 0U, 0U};
+            static uint8_t bmi_id_status = 0U;
+            static uint8_t bmi_accel_id = 0U;
+            static uint8_t bmi_gyro_id = 0U;
+            static uint8_t bmi_imu_error = 0U;
+            static uint8_t bmi_bus_error = 0U;
+            static uint8_t bmi_init_stage = 0U;
+            static uint32_t bmi_retry_tick = 0U;
+            static uint32_t bmi_last_tick = 0U;
+            uint32_t bmi_now = sys_10ms_tick;
+
+            if (!bmi_ok && (!bmi_attempted ||
+                            (uint32_t)(bmi_now - bmi_retry_tick) >= 100U)) {
+                bmi_attempted = 1U;
+                bmi_retry_tick = bmi_now;
+                bmi_ok = IMU_InitAndCalibrate();
+                if (bmi_ok) {
                     AHRS_Init(0.0f, 0.0f);
+                    bmi_last_tick = sys_10ms_tick;
+                } else if (!bmi_scan_done) {
+                    /* Preserve the real cause before the diagnostic reads
+                     * clear the I2C driver's last-error state. */
+                    bmi_imu_error = IMU_GetInitError();
+                    bmi_bus_error = BMI088_GetLastError();
+                    bmi_init_stage = BMI088_GetInitStage();
+                    bmi_scan_count = BMI088_ScanI2C(bmi_scan_addresses,
+                                                    sizeof(bmi_scan_addresses));
+                    bmi_id_status = BMI088_ReadRawIds(&bmi_accel_id,
+                                                       &bmi_gyro_id);
+                    bmi_scan_done = 1U;
                 }
             }
 
@@ -156,13 +185,12 @@ int main(void)
         Huidu_Sensor_Task();
 
         /* IMU has priority over all OLED drawing. */
-        if (icm_ok) {
-            static uint32_t last_tick = 0U;
+        if (bmi_ok) {
             uint32_t now = sys_10ms_tick;
-            int32_t diff = (int32_t)(now - last_tick);
+            int32_t diff = (int32_t)(now - bmi_last_tick);
             if (diff > 0) {
                 IMU_Update((float)diff * 0.01f, huidu_pid_flag == 0U);
-                last_tick = now;
+                bmi_last_tick = now;
             }
         }
 
@@ -186,17 +214,60 @@ int main(void)
         }
 
         /* 第3行：互补滤波 Yaw */
-        if (icm_ok) {
+        if (bmi_ok) {
             OLED_ShowString(0, 32, (uint8_t *)"YAW:");
             OLED_ShowSignedNum(30, 32, (int32_t)AHRS_GetYaw(), 5, 12);
         } else {
-            OLED_ShowString(0, 32, (uint8_t *)"YAW:---");
+            uint8_t i;
+            uint8_t pos = 0U;
+            uint8_t shown = bmi_scan_count;
+            uint8_t text[16] = "I2C:";
+            static const uint8_t hex[] = "0123456789ABCDEF";
+
+            if (!bmi_scan_done) {
+                OLED_ShowString(0, 32, (uint8_t *)"I2C:SCAN");
+            } else if (bmi_id_status != 0U) {
+                uint8_t id_text[] = "E0B0S0 1E0F";
+
+                id_text[1] = (uint8_t)('0' + bmi_imu_error);
+                id_text[3] = (uint8_t)('0' + bmi_bus_error);
+                id_text[5] = (uint8_t)('0' + bmi_init_stage);
+
+                if ((bmi_id_status & 0x01U) != 0U) {
+                    id_text[7] = hex[(bmi_accel_id >> 4) & 0x0FU];
+                    id_text[8] = hex[bmi_accel_id & 0x0FU];
+                }
+                if ((bmi_id_status & 0x02U) != 0U) {
+                    id_text[9] = hex[(bmi_gyro_id >> 4) & 0x0FU];
+                    id_text[10] = hex[bmi_gyro_id & 0x0FU];
+                }
+                OLED_ShowString(0, 32, id_text);
+            } else if (shown == 0U) {
+                OLED_ShowString(0, 32, (uint8_t *)"I2C:-- E03");
+            } else {
+                pos = 4U;
+                if (shown > sizeof(bmi_scan_addresses)) {
+                    shown = sizeof(bmi_scan_addresses);
+                }
+                for (i = 0U; i < shown; ++i) {
+                    text[pos++] = hex[bmi_scan_addresses[i] >> 4];
+                    text[pos++] = hex[bmi_scan_addresses[i] & 0x0FU];
+                    if (i + 1U < shown) {
+                        text[pos++] = ' ';
+                    }
+                }
+                text[pos] = '\0';
+                OLED_ShowString(0, 32, text);
+            }
         }
-        }  /* end of icm_ok/icm_attempted static block */
+        }  /* end of bmi_ok/bmi_attempted static block */
 
         /* 第4行：目标圈数 */
         OLED_ShowString(0, 48, (uint8_t *)"LAP:");
         OLED_ShowNumber(30, 48, target_lap, 2, 12);
+        OLED_ShowString(48, 48, (uint8_t *)"RD:");
+        OLED_ShowNumber(66, 48, BMI088_GetGyroReadTimeUs(), 4, 12);
+        OLED_ShowString(90, 48, (uint8_t *)"us");
 
         if (oled_debug_page != 0U) {
             OLED_DrawDebugPage();

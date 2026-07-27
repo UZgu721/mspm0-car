@@ -1,270 +1,626 @@
 #include "icm42688.h"
-#include "board.h"   /* delay_us, delay_ms */
+#include "board.h"
 
-/* ── 全局变量 ── */
-float icm42688_acc_x, icm42688_acc_y, icm42688_acc_z;
-float icm42688_gyro_x, icm42688_gyro_y, icm42688_gyro_z;
-float gx, gy, gz;
-float ax, ay, az;
+/* BMI088 register map and settings, taken from the supplied Bosch BMI088
+ * example: accel +/-6 g, gyro +/-1000 dps, both at 100 Hz. */
+#define BMI088_REG_CHIP_ID             0x00U
 
-/* 转换系数 */
-static float icm42688_acc_inv  = 16000.0f / 32768.0f;
-static float icm42688_gyro_inv = 2000.0f / 32768.0f;
+#define BMI088_ACCEL_CHIP_ID_BMI085    0x1AU
+#define BMI088_ACCEL_CHIP_ID_BMI088    0x1EU
+#define BMI088_GYRO_CHIP_ID            0x0FU
 
-/* 陀螺 Z 轴零偏（启动校准） */
-float gz_bias = 0.0f;
+#define BMI088_ACCEL_X_LSB             0x12U
+#define BMI088_ACCEL_CONF              0x40U
+#define BMI088_ACCEL_RANGE             0x41U
+#define BMI088_ACCEL_PWR_CONF          0x7CU
+#define BMI088_ACCEL_PWR_CTRL          0x7DU
+#define BMI088_ACCEL_SOFTRESET         0x7EU
 
-/* ── I2C 辅助（参照 MSPM0 官方桥接示例） ── */
+#define BMI088_GYRO_X_LSB              0x02U
+#define BMI088_GYRO_RANGE              0x0FU
+#define BMI088_GYRO_BANDWIDTH          0x10U
+#define BMI088_GYRO_LPM1               0x11U
+#define BMI088_GYRO_SOFTRESET          0x14U
 
-/**
- * @brief I2C 总线恢复：SCL发9个时钟释放被锁死的SDA
- */
+#define BMI088_SOFTRESET_CMD           0xB6U
+#define BMI088_ACCEL_CONF_100HZ_NORMAL 0xA8U
+#define BMI088_ACCEL_RANGE_6G          0x01U
+#define BMI088_ACCEL_POWER_ENABLE      0x04U
+#define BMI088_ACCEL_POWER_ACTIVE      0x00U
+#define BMI088_GYRO_RANGE_1000DPS      0x01U
+#define BMI088_GYRO_BW_32_100HZ        0x07U
+#define BMI088_GYRO_POWER_NORMAL       0x00U
+
+#define BMI088_ACCEL_MG_PER_LSB        (6000.0f / 32768.0f)
+#define BMI088_GYRO_DPS_PER_LSB        (1000.0f / 32768.0f)
+#define BMI088_I2C_TIMEOUT             100000UL
+/* BUSCLK is 40 MHz. (1 + 39) * (6 + 4) / 40 MHz = 10 us = 100 kHz. */
+#define BMI088_I2C_TPR_100KHZ          39U
+#define BMI088_I2C_START_SETTLE_US     2U
+#define BMI088_SOFT_I2C_HALF_US         5U
+#define BMI088_WRITE_RETRY_COUNT         3U
+
+static uint8_t bmi088_accel_addr;
+static uint8_t bmi088_gyro_addr;
+static uint8_t bmi088_last_error;
+static uint8_t bmi088_init_stage;
+static uint32_t bmi088_gyro_read_time_us;
+
+/* SysTick is a free-running 24-bit down-counter clocked at SysTickFre.
+ * The measured interval is much shorter than one counter period. */
+static uint32_t BMI088_TicksToUs(uint32_t start_tick, uint32_t end_tick)
+{
+    uint32_t elapsed_ticks;
+
+    if (start_tick >= end_tick) {
+        elapsed_ticks = start_tick - end_tick;
+    } else {
+        elapsed_ticks = start_tick + (SysTickMAX_COUNT + 1U) - end_tick;
+    }
+    return (elapsed_ticks + (SysTickFre / 2000000U)) /
+           (SysTickFre / 1000000U);
+}
+
+static uint8_t I2C_HasError(void)
+{
+    if ((DL_I2C_getControllerStatus(I2C_0_INST) &
+            DL_I2C_CONTROLLER_STATUS_ERROR) != 0U) {
+        bmi088_last_error = BMI088_ERROR_I2C_NACK;
+        return 1U;
+    }
+    return 0U;
+}
+
+static uint8_t I2C_WaitIdle(void)
+{
+    uint32_t timeout = BMI088_I2C_TIMEOUT;
+
+    while ((DL_I2C_getControllerStatus(I2C_0_INST) &
+            DL_I2C_CONTROLLER_STATUS_IDLE) == 0U) {
+        if (--timeout == 0U) {
+            bmi088_last_error = BMI088_ERROR_IDLE_TIMEOUT;
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+/* A register-address phase intentionally holds the bus for a repeated START,
+ * so it must not wait for BUSY_BUS or IDLE. */
+static uint8_t I2C_WaitTransferNoStop(void)
+{
+    uint32_t timeout = BMI088_I2C_TIMEOUT;
+
+    while ((DL_I2C_getControllerStatus(I2C_0_INST) &
+            DL_I2C_CONTROLLER_STATUS_BUSY) != 0U) {
+        if (I2C_HasError() != 0U) {
+            return 0U;
+        }
+        if (--timeout == 0U) {
+            bmi088_last_error = BMI088_ERROR_TRANSFER_TIMEOUT;
+            return 0U;
+        }
+    }
+
+    return (I2C_HasError() == 0U) ? 1U : 0U;
+}
+
+static uint8_t I2C_WaitTransferComplete(void)
+{
+    uint32_t timeout;
+
+    if (I2C_WaitTransferNoStop() == 0U) {
+        return 0U;
+    }
+
+    timeout = BMI088_I2C_TIMEOUT;
+    while ((DL_I2C_getControllerStatus(I2C_0_INST) &
+            DL_I2C_CONTROLLER_STATUS_BUSY_BUS) != 0U) {
+        if (I2C_HasError() != 0U) {
+            return 0U;
+        }
+        if (--timeout == 0U) {
+            bmi088_last_error = BMI088_ERROR_TRANSFER_TIMEOUT;
+            return 0U;
+        }
+    }
+    return I2C_WaitIdle();
+}
+
+/* A no-STOP register-address phase keeps the bus busy by design. Wait for
+ * the controller's TX-complete event before issuing the repeated START. */
+static uint8_t I2C_WaitTxDone(void)
+{
+    uint32_t timeout = BMI088_I2C_TIMEOUT;
+
+    while (DL_I2C_getRawInterruptStatus(I2C_0_INST,
+            DL_I2C_INTERRUPT_CONTROLLER_TX_DONE) == 0U) {
+        if (I2C_HasError() != 0U) {
+            return 0U;
+        }
+        if (--timeout == 0U) {
+            bmi088_last_error = BMI088_ERROR_TRANSFER_TIMEOUT;
+            return 0U;
+        }
+    }
+    DL_I2C_clearInterruptStatus(I2C_0_INST,
+        DL_I2C_INTERRUPT_CONTROLLER_TX_DONE);
+    return 1U;
+}
+
+static uint8_t I2C_WaitRxDone(void)
+{
+    uint32_t timeout = BMI088_I2C_TIMEOUT;
+
+    while (DL_I2C_getRawInterruptStatus(I2C_0_INST,
+            DL_I2C_INTERRUPT_CONTROLLER_RX_DONE) == 0U) {
+        if (I2C_HasError() != 0U) {
+            return 0U;
+        }
+        if (--timeout == 0U) {
+            bmi088_last_error = BMI088_ERROR_TRANSFER_TIMEOUT;
+            return 0U;
+        }
+    }
+    DL_I2C_clearInterruptStatus(I2C_0_INST,
+        DL_I2C_INTERRUPT_CONTROLLER_RX_DONE);
+    return I2C_WaitIdle();
+}
+
+/* Temporarily clocks SCL nine times to release a slave that holds SDA low. */
 static void I2C_BusRecover(void)
 {
-    /* 临时将 SCL(PA1) 改为 GPIO 输出 */
-    DL_GPIO_initDigitalOutput(GPIO_I2C_0_IOMUX_SCL);
-    for (int i = 0; i < 9; i++) {
-        DL_GPIO_clearPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
-        delay_us(5);
-        DL_GPIO_setPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
-        delay_us(5);
+    uint8_t i;
+
+    /* A normal idle bus must not be clocked unnecessarily. */
+    if ((DL_GPIO_readPins(GPIO_I2C_0_SDA_PORT, GPIO_I2C_0_SDA_PIN) != 0U) &&
+        (DL_GPIO_readPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN) != 0U)) {
+        return;
     }
-    /* 恢复为 I2C 开漏外设功能（与 SYSCFG_DL_GPIO_init 一致） */
+
+    DL_GPIO_initDigitalOutput(GPIO_I2C_0_IOMUX_SCL);
+    DL_GPIO_enableOutput(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+    DL_GPIO_setPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+    for (i = 0U; i < 9U; ++i) {
+        DL_GPIO_clearPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+        delay_us(5U);
+        DL_GPIO_setPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+        delay_us(5U);
+    }
+
     DL_GPIO_initPeripheralInputFunctionFeatures(GPIO_I2C_0_IOMUX_SCL,
         GPIO_I2C_0_IOMUX_SCL_FUNC, DL_GPIO_INVERSION_DISABLE,
         DL_GPIO_RESISTOR_NONE, DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
     DL_GPIO_initPeripheralInputFunctionFeatures(GPIO_I2C_0_IOMUX_SDA,
         GPIO_I2C_0_IOMUX_SDA_FUNC, DL_GPIO_INVERSION_DISABLE,
         DL_GPIO_RESISTOR_NONE, DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_disableOutput(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
     DL_GPIO_enableHiZ(GPIO_I2C_0_IOMUX_SCL);
     DL_GPIO_enableHiZ(GPIO_I2C_0_IOMUX_SDA);
 }
 
-/**
- * @brief I2C 总线恢复：确保控制器空闲再开始
- */
-static void I2C_WaitIdle(void)
+static void I2C_ConfigureController(void)
 {
-    uint32_t to = 100000;
-    while (!(DL_I2C_getControllerStatus(I2C_0_INST) & DL_I2C_CONTROLLER_STATUS_IDLE)
-           && --to);
-}
-
-/**
- * @brief 写 ICM42688 寄存器（2字节：reg + data）
- */
-static void ICM42688_WriteReg(uint8_t reg, uint8_t data)
-{
-    uint32_t to;
-    uint8_t tx[2] = { reg, data };
-
-    I2C_WaitIdle();
-    DL_I2C_flushControllerTXFIFO(I2C_0_INST);
-    DL_I2C_fillControllerTXFIFO(I2C_0_INST, tx, 2);
-    DL_I2C_startControllerTransfer(I2C_0_INST, ICM42688_I2C_ADDR,
-        DL_I2C_CONTROLLER_DIRECTION_TX, 2);
-
-    to = 100000;
-    while ((DL_I2C_getControllerStatus(I2C_0_INST) & DL_I2C_CONTROLLER_STATUS_BUSY)
-           && --to);
-    to = 100000;
-    while ((DL_I2C_getControllerStatus(I2C_0_INST) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS)
-           && --to);
-    I2C_WaitIdle();
-}
-
-/**
- * @brief 读 ICM42688 多寄存器（发reg→repeated START→读len字节）
- */
-static void ICM42688_ReadRegs(uint8_t reg, uint8_t *buf, uint8_t len)
-{
-    uint32_t to;
-
-    /* Phase 1: 发寄存器地址，不产生 STOP */
-    I2C_WaitIdle();
-    DL_I2C_flushControllerTXFIFO(I2C_0_INST);
-    DL_I2C_fillControllerTXFIFO(I2C_0_INST, &reg, 1);
-    DL_I2C_startControllerTransferAdvanced(I2C_0_INST, ICM42688_I2C_ADDR,
-        DL_I2C_CONTROLLER_DIRECTION_TX, 1,
-        DL_I2C_CONTROLLER_START_ENABLE,
-        DL_I2C_CONTROLLER_STOP_DISABLE,
-        DL_I2C_CONTROLLER_ACK_ENABLE);
-    to = 100000;
-    while ((DL_I2C_getControllerStatus(I2C_0_INST) & DL_I2C_CONTROLLER_STATUS_BUSY)
-           && --to);
-
-    /* Phase 2: Repeated START + 读 + STOP */
-    DL_I2C_startControllerTransferAdvanced(I2C_0_INST, ICM42688_I2C_ADDR,
-        DL_I2C_CONTROLLER_DIRECTION_RX, len,
-        DL_I2C_CONTROLLER_START_ENABLE,
-        DL_I2C_CONTROLLER_STOP_ENABLE,
-        DL_I2C_CONTROLLER_ACK_ENABLE);
-    to = 100000;
-    while ((DL_I2C_getControllerStatus(I2C_0_INST) & DL_I2C_CONTROLLER_STATUS_BUSY)
-           && --to);
-    to = 100000;
-    while ((DL_I2C_getControllerStatus(I2C_0_INST) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS)
-           && --to);
-    I2C_WaitIdle();
-
-    /* 读取 RX FIFO */
-    for (uint8_t i = 0; i < len; i++) {
-        buf[i] = DL_I2C_receiveControllerData(I2C_0_INST);
-    }
-}
-
-/* ── 量程/ODR 配置 ── */
-
-void ICM42688_Set_Range(enum icm42688_afs afs, enum icm42688_aodr aodr,
-                        enum icm42688_gfs gfs, enum icm42688_godr godr)
-{
-    ICM42688_WriteReg(ICM42688_ACCEL_CONFIG0, (uint8_t)((afs << 5) | (aodr + 1)));
-    ICM42688_WriteReg(ICM42688_GYRO_CONFIG0,  (uint8_t)((gfs << 5) | (godr + 1)));
-
-    switch (afs) {
-    case ICM42688_AFS_2G:  icm42688_acc_inv = 2000.0f  / 32768.0f; break;
-    case ICM42688_AFS_4G:  icm42688_acc_inv = 4000.0f  / 32768.0f; break;
-    case ICM42688_AFS_8G:  icm42688_acc_inv = 8000.0f  / 32768.0f; break;
-    case ICM42688_AFS_16G: icm42688_acc_inv = 16000.0f / 32768.0f; break;
-    default: break;
-    }
-    switch (gfs) {
-    case ICM42688_GFS_15_625DPS: icm42688_gyro_inv = 15.625f  / 32768.0f; break;
-    case ICM42688_GFS_31_25DPS:  icm42688_gyro_inv = 31.25f   / 32768.0f; break;
-    case ICM42688_GFS_62_5DPS:   icm42688_gyro_inv = 62.5f    / 32768.0f; break;
-    case ICM42688_GFS_125DPS:    icm42688_gyro_inv = 125.0f   / 32768.0f; break;
-    case ICM42688_GFS_250DPS:    icm42688_gyro_inv = 250.0f   / 32768.0f; break;
-    case ICM42688_GFS_500DPS:    icm42688_gyro_inv = 500.0f   / 32768.0f; break;
-    case ICM42688_GFS_1000DPS:   icm42688_gyro_inv = 1000.0f  / 32768.0f; break;
-    case ICM42688_GFS_2000DPS:   icm42688_gyro_inv = 2000.0f  / 32768.0f; break;
-    default: break;
-    }
-}
-
-/* ── 初始化 ── */
-
-/**
- * @brief ICM42688 初始化，返回 1=成功 0=失败（不阻塞系统）
- */
-uint8_t ICM42688_Init(void)
-{
-    uint8_t whoami = 0;
-    uint8_t retry  = 50;
-
-    /* 总线恢复（释放可能被锁死的 SDA） */
-    I2C_BusRecover();
-
-    /* 完善 I2C0 配置（SysConfig 生成的 init 不足） */
+    DL_I2C_disableController(I2C_0_INST);
     DL_I2C_resetControllerTransfer(I2C_0_INST);
-    DL_I2C_setTimerPeriod(I2C_0_INST, 7);                /* 400kHz @ 40MHz BUSCLK */
+    DL_I2C_flushControllerTXFIFO(I2C_0_INST);
+    DL_I2C_flushControllerRXFIFO(I2C_0_INST);
+    DL_I2C_setTimerPeriod(I2C_0_INST, BMI088_I2C_TPR_100KHZ);
     DL_I2C_setControllerTXFIFOThreshold(I2C_0_INST, DL_I2C_TX_FIFO_LEVEL_BYTES_1);
     DL_I2C_setControllerRXFIFOThreshold(I2C_0_INST, DL_I2C_RX_FIFO_LEVEL_BYTES_1);
+    DL_I2C_enableControllerClockStretching(I2C_0_INST);
     DL_I2C_enableController(I2C_0_INST);
+}
 
-    /* WHO_AM_I 检测（500ms 超时） */
-    while (retry--) {
-        ICM42688_ReadRegs(ICM42688_WHO_AM_I, &whoami, 1);
-        if (whoami == ICM42688_WHO_AM_I_VAL) break;
-        delay_ms(10);
+/* BMI088 uses standard-mode I2C. GPIO output-enable is used as an open-drain
+ * driver: drive only low, and release the pin for the external pull-up. This
+ * avoids the controller repeated-START state-machine issue seen on this board. */
+static void SoftI2C_SdaLow(void)
+{
+    DL_GPIO_clearPins(GPIO_I2C_0_SDA_PORT, GPIO_I2C_0_SDA_PIN);
+    DL_GPIO_enableOutput(GPIO_I2C_0_SDA_PORT, GPIO_I2C_0_SDA_PIN);
+}
+
+static void SoftI2C_SdaRelease(void)
+{
+    DL_GPIO_disableOutput(GPIO_I2C_0_SDA_PORT, GPIO_I2C_0_SDA_PIN);
+}
+
+static void SoftI2C_SclLow(void)
+{
+    DL_GPIO_clearPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+    DL_GPIO_enableOutput(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+}
+
+static void SoftI2C_SclRelease(void)
+{
+    DL_GPIO_disableOutput(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN);
+}
+
+static uint8_t SoftI2C_WaitSclHigh(void)
+{
+    uint32_t timeout = 1000U;
+
+    while (DL_GPIO_readPins(GPIO_I2C_0_SCL_PORT, GPIO_I2C_0_SCL_PIN) == 0U) {
+        if (--timeout == 0U) {
+            bmi088_last_error = BMI088_ERROR_TRANSFER_TIMEOUT;
+            return 0U;
+        }
+        delay_us(1U);
     }
-    if (whoami != ICM42688_WHO_AM_I_VAL) {
-        return 0;   /* 未检测到，返回失败 */
+    return 1U;
+}
+
+static void SoftI2C_Start(void)
+{
+    SoftI2C_SdaRelease();
+    SoftI2C_SclRelease();
+    (void)SoftI2C_WaitSclHigh();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SdaLow();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SclLow();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+}
+
+static void SoftI2C_Stop(void)
+{
+    SoftI2C_SdaLow();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SclRelease();
+    (void)SoftI2C_WaitSclHigh();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SdaRelease();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+}
+
+static uint8_t SoftI2C_WriteByte(uint8_t value)
+{
+    uint8_t bit;
+    uint8_t ack;
+
+    for (bit = 0x80U; bit != 0U; bit >>= 1U) {
+        if ((value & bit) != 0U) {
+            SoftI2C_SdaRelease();
+        } else {
+            SoftI2C_SdaLow();
+        }
+        delay_us(BMI088_SOFT_I2C_HALF_US);
+        SoftI2C_SclRelease();
+        if (SoftI2C_WaitSclHigh() == 0U) {
+            return 0U;
+        }
+        delay_us(BMI088_SOFT_I2C_HALF_US);
+        SoftI2C_SclLow();
     }
 
-    /* 器件复位 */
-    ICM42688_WriteReg(ICM42688_PWR_MGMT0, 0x00);
-    delay_ms(10);
-
-    /* 配置量程和 ODR */
-    ICM42688_Set_Range(ICM42688_AFS_16G, ICM42688_AODR_1000HZ,
-                       ICM42688_GFS_2000DPS, ICM42688_GODR_1000HZ);
-
-    /* 使能陀螺仪和加速度计 */
-    ICM42688_WriteReg(ICM42688_PWR_MGMT0, 0x0F);
-    delay_ms(200);  /* 等传感器稳定 */
-
-    /* Bias calibration is performed once by IMU_InitAndCalibrate(). */
-    gz_bias = 0.0f;
-
-    return 1;   /* 初始化成功 */
+    SoftI2C_SdaRelease();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SclRelease();
+    if (SoftI2C_WaitSclHigh() == 0U) {
+        return 0U;
+    }
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    ack = (DL_GPIO_readPins(GPIO_I2C_0_SDA_PORT, GPIO_I2C_0_SDA_PIN) == 0U) ? 1U : 0U;
+    SoftI2C_SclLow();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    if (ack == 0U) {
+        bmi088_last_error = BMI088_ERROR_I2C_NACK;
+    }
+    return ack;
 }
 
-/* ── 数据读取 ── */
-
-void ICM42688_Read_Accel(void)
+static uint8_t SoftI2C_ReadByte(uint8_t send_ack)
 {
-    uint8_t xh, xl, yh, yl, zh, zl;
-    /* 逐字节读，避免 I2C burst 自动增量问题 */
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_X1, &xh, 1);
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_X0, &xl, 1);
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_Y1, &yh, 1);
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_Y0, &yl, 1);
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_Z1, &zh, 1);
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_Z0, &zl, 1);
-    icm42688_acc_x = icm42688_acc_inv * (int16_t)(((uint16_t)xh << 8) | xl);
-    icm42688_acc_y = icm42688_acc_inv * (int16_t)(((uint16_t)yh << 8) | yl);
-    icm42688_acc_z = icm42688_acc_inv * (int16_t)(((uint16_t)zh << 8) | zl);
-    ax = icm42688_acc_x;
-    ay = icm42688_acc_y;
-    az = icm42688_acc_z;
+    uint8_t bit;
+    uint8_t value = 0U;
+
+    SoftI2C_SdaRelease();
+    for (bit = 0x80U; bit != 0U; bit >>= 1U) {
+        delay_us(BMI088_SOFT_I2C_HALF_US);
+        SoftI2C_SclRelease();
+        (void)SoftI2C_WaitSclHigh();
+        delay_us(BMI088_SOFT_I2C_HALF_US);
+        if (DL_GPIO_readPins(GPIO_I2C_0_SDA_PORT, GPIO_I2C_0_SDA_PIN) != 0U) {
+            value |= bit;
+        }
+        SoftI2C_SclLow();
+    }
+
+    if (send_ack != 0U) {
+        SoftI2C_SdaLow();
+    } else {
+        SoftI2C_SdaRelease();
+    }
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SclRelease();
+    (void)SoftI2C_WaitSclHigh();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
+    SoftI2C_SclLow();
+    SoftI2C_SdaRelease();
+    return value;
 }
 
-/**
- * @brief 只读陀螺Z轴（快通道，2次I2C ~0.5ms）
- *        不影响灰度巡线刷新率
- */
-void ICM42688_Read_GyroZ(void)
+static void SoftI2C_Init(void)
 {
-    uint8_t zh, zl;
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_Z1, &zh, 1);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_Z0, &zl, 1);
-    icm42688_gyro_z = icm42688_gyro_inv * (int16_t)(((uint16_t)zh << 8) | zl);
-    gz = icm42688_gyro_z - gz_bias;
+    DL_I2C_disableController(I2C_0_INST);
+    /* Keep GPIO input buffers enabled while output-enable is toggled below.
+     * Otherwise released SDA cannot sample a slave ACK. */
+    DL_GPIO_initDigitalInputFeatures(GPIO_I2C_0_IOMUX_SDA,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_NONE,
+        DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    DL_GPIO_initDigitalInputFeatures(GPIO_I2C_0_IOMUX_SCL,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_NONE,
+        DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+    SoftI2C_SdaRelease();
+    SoftI2C_SclRelease();
+    delay_us(BMI088_SOFT_I2C_HALF_US);
 }
 
-void ICM42688_Read_Gyro(void)
+static uint8_t BMI088_WriteReg(uint8_t address, uint8_t reg, uint8_t value)
 {
-    uint8_t xh, xl, yh, yl, zh, zl;
-    /* 逐字节读，避免 I2C burst 自动增量问题 */
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_X1, &xh, 1);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_X0, &xl, 1);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_Y1, &yh, 1);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_Y0, &yl, 1);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_Z1, &zh, 1);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_Z0, &zl, 1);
-    icm42688_gyro_x = icm42688_gyro_inv * (int16_t)(((uint16_t)xh << 8) | xl);
-    icm42688_gyro_y = icm42688_gyro_inv * (int16_t)(((uint16_t)yh << 8) | yl);
-    icm42688_gyro_z = icm42688_gyro_inv * (int16_t)(((uint16_t)zh << 8) | zl);
-    gx = icm42688_gyro_x;
-    gy = icm42688_gyro_y;
-    gz = icm42688_gyro_z - gz_bias;  /* 消零偏 */
+    uint8_t attempt;
+
+    for (attempt = 0U; attempt < BMI088_WRITE_RETRY_COUNT; ++attempt) {
+        SoftI2C_Start();
+        if ((SoftI2C_WriteByte((uint8_t)(address << 1U)) != 0U) &&
+            (SoftI2C_WriteByte(reg) != 0U) &&
+            (SoftI2C_WriteByte(value) != 0U)) {
+            SoftI2C_Stop();
+            bmi088_last_error = BMI088_ERROR_NONE;
+            return 1U;
+        }
+        SoftI2C_Stop();
+        /* Give a device that just left reset, or a stretched bus, a clean
+         * STOP-to-START interval before retrying the whole transaction. */
+        delay_ms(2U);
+        SoftI2C_Init();
+    }
+    return 0U;
 }
 
-/* Read each sensor block in one transaction.  Six bytes fits the MSPM0 I2C
- * RX FIFO and avoids combining different sampling instants byte by byte. */
-void ICM42688_ReadSample(ICM42688_Sample_t *sample)
+static uint8_t BMI088_ReadRegs(uint8_t address, uint8_t reg, uint8_t *buf,
+                               uint8_t length)
 {
-    uint8_t acc[6];
+    uint8_t i;
+
+    if ((buf == 0) || (length == 0U)) {
+        return 0U;
+    }
+
+    SoftI2C_Start();
+    if ((SoftI2C_WriteByte((uint8_t)(address << 1U)) == 0U) ||
+        (SoftI2C_WriteByte(reg) == 0U)) {
+        SoftI2C_Stop();
+        return 0U;
+    }
+    SoftI2C_Start();
+    if (SoftI2C_WriteByte((uint8_t)((address << 1U) | 0x01U)) == 0U) {
+        SoftI2C_Stop();
+        return 0U;
+    }
+
+    for (i = 0U; i < length; ++i) {
+        buf[i] = SoftI2C_ReadByte((i + 1U < length) ? 1U : 0U);
+    }
+    SoftI2C_Stop();
+    bmi088_last_error = BMI088_ERROR_NONE;
+    return 1U;
+}
+
+/* Address scanner helper. The received byte is intentionally discarded: an
+ * ACK is all that is needed to report an I2C target address. */
+static uint8_t I2C_ProbeAddress(uint8_t address)
+{
+    SoftI2C_Start();
+    if (SoftI2C_WriteByte((uint8_t)((address << 1U) | 0x01U)) == 0U) {
+        SoftI2C_Stop();
+        return 0U;
+    }
+    (void)SoftI2C_ReadByte(0U);
+    SoftI2C_Stop();
+    bmi088_last_error = BMI088_ERROR_NONE;
+    return 1U;
+}
+
+static uint8_t BMI088_DetectAddress(uint8_t address,
+                                    uint8_t expected_id_a, uint8_t expected_id_b,
+                                    uint8_t *detected_address)
+{
+    uint8_t id = 0U;
+
+    /* BMI088 specifies a write of register 0x00 followed by a repeated
+     * START for every register read, including CHIP_ID. */
+    if (BMI088_ReadRegs(address, BMI088_REG_CHIP_ID, &id, 1U) != 0U &&
+        (id == expected_id_a || id == expected_id_b)) {
+        *detected_address = address;
+        return 1U;
+    }
+    return 0U;
+}
+
+uint8_t BMI088_Init(void)
+{
+    bmi088_last_error = BMI088_ERROR_NONE;
+    bmi088_init_stage = 0U;
+    SoftI2C_Init();
+
+    if (BMI088_DetectAddress(BMI088_ACCEL_ADDR,
+            BMI088_ACCEL_CHIP_ID_BMI085, BMI088_ACCEL_CHIP_ID_BMI088,
+            &bmi088_accel_addr) == 0U) {
+        if (bmi088_last_error == BMI088_ERROR_NONE) {
+            bmi088_last_error = BMI088_ERROR_ACCEL_NOT_FOUND;
+        }
+        return 0U;
+    }
+    if (BMI088_DetectAddress(BMI088_GYRO_ADDR,
+            BMI088_GYRO_CHIP_ID, BMI088_GYRO_CHIP_ID, &bmi088_gyro_addr) == 0U) {
+        if (bmi088_last_error == BMI088_ERROR_NONE) {
+            bmi088_last_error = BMI088_ERROR_GYRO_NOT_FOUND;
+        }
+        return 0U;
+    }
+
+    /* The board already holds reset/startup for 5 s before calling this
+     * driver, so both BMI088 dies are in their documented power-on state.
+     * On this module the gyro NACKs its 0x14 soft-reset write immediately
+     * after the accel 0x7E reset, even though both CHIP_ID reads are valid.
+     * Do not issue those redundant independent soft resets; configure the
+     * verified power-on state directly instead. */
+    delay_ms(2U);
+
+    /* Bosch BMI088 sequence: activate accel PWR_CONF first, then enable
+     * PWR_CTRL after 5 ms.  Reversing these two writes can leave the accel
+     * suspended, so all later XYZ reads fail despite valid CHIP_ID values. */
+    bmi088_init_stage = 3U;
+    if (BMI088_WriteReg(bmi088_accel_addr, BMI088_ACCEL_PWR_CONF,
+            BMI088_ACCEL_POWER_ACTIVE) == 0U) {
+        bmi088_last_error = BMI088_ERROR_CONFIGURATION;
+        return 0U;
+    }
+    delay_ms(5U);
+    bmi088_init_stage = 4U;
+    if (BMI088_WriteReg(bmi088_accel_addr, BMI088_ACCEL_PWR_CTRL,
+            BMI088_ACCEL_POWER_ENABLE) == 0U) {
+        bmi088_last_error = BMI088_ERROR_CONFIGURATION;
+        return 0U;
+    }
+    delay_ms(5U);
+
+    bmi088_init_stage = 5U;
+    if (BMI088_WriteReg(bmi088_accel_addr, BMI088_ACCEL_CONF,
+            BMI088_ACCEL_CONF_100HZ_NORMAL) == 0U ||
+        BMI088_WriteReg(bmi088_accel_addr, BMI088_ACCEL_RANGE,
+            BMI088_ACCEL_RANGE_6G) == 0U) {
+        bmi088_last_error = BMI088_ERROR_CONFIGURATION;
+        return 0U;
+    }
+
+    /* The gyro needs a full 30 ms after leaving suspend mode before its
+     * bandwidth/range registers and data outputs are used. */
+    bmi088_init_stage = 6U;
+    if (BMI088_WriteReg(bmi088_gyro_addr, BMI088_GYRO_LPM1,
+            BMI088_GYRO_POWER_NORMAL) == 0U) {
+        bmi088_last_error = BMI088_ERROR_CONFIGURATION;
+        return 0U;
+    }
+    delay_ms(30U);
+    bmi088_init_stage = 7U;
+    if (BMI088_WriteReg(bmi088_gyro_addr, BMI088_GYRO_BANDWIDTH,
+            BMI088_GYRO_BW_32_100HZ) == 0U ||
+        BMI088_WriteReg(bmi088_gyro_addr, BMI088_GYRO_RANGE,
+            BMI088_GYRO_RANGE_1000DPS) == 0U) {
+        bmi088_last_error = BMI088_ERROR_CONFIGURATION;
+        return 0U;
+    }
+
+    delay_ms(50U);
+    bmi088_init_stage = 0U;
+    return 1U;
+}
+
+uint8_t BMI088_GetLastError(void)
+{
+    return bmi088_last_error;
+}
+
+uint8_t BMI088_GetInitStage(void)
+{
+    return bmi088_init_stage;
+}
+
+uint32_t BMI088_GetGyroReadTimeUs(void)
+{
+    return bmi088_gyro_read_time_us;
+}
+
+uint8_t BMI088_ReadRawIds(uint8_t *accel_id, uint8_t *gyro_id)
+{
+    uint8_t result = 0U;
+
+    if ((accel_id == 0) || (gyro_id == 0)) {
+        return 0U;
+    }
+
+    /* The scan has already established that the addresses ACK.  These reads
+     * deliberately use the BMI088-required register-write/repeated-START
+     * transaction so the OLED can expose the actual ID bytes. */
+    SoftI2C_Init();
+    if (BMI088_ReadRegs(BMI088_ACCEL_ADDR, BMI088_REG_CHIP_ID,
+                        accel_id, 1U) != 0U) {
+        result |= 0x01U;
+    }
+    if (BMI088_ReadRegs(BMI088_GYRO_ADDR, BMI088_REG_CHIP_ID,
+                        gyro_id, 1U) != 0U) {
+        result |= 0x02U;
+    }
+
+    return result;
+}
+
+uint8_t BMI088_ScanI2C(uint8_t *addresses, uint8_t max_addresses)
+{
+    uint8_t address;
+    uint8_t count = 0U;
+
+    if ((addresses == 0) || (max_addresses == 0U)) {
+        return 0U;
+    }
+
+    for (address = 0x08U; address < 0x78U; ++address) {
+        if (I2C_ProbeAddress(address) != 0U) {
+            if (count < max_addresses) {
+                addresses[count] = address;
+            }
+            ++count;
+        }
+    }
+
+    if (count == 0U) {
+        bmi088_last_error = BMI088_ERROR_I2C_NACK;
+    }
+    return count;
+}
+
+uint8_t BMI088_ReadSample(BMI088_Sample_t *sample)
+{
+    uint8_t accel[6];
     uint8_t gyro[6];
+    uint32_t gyro_read_start;
+    uint32_t gyro_read_end;
+    int16_t raw;
 
-    if (sample == 0) {
-        return;
+    if (sample == 0 ||
+        BMI088_ReadRegs(bmi088_accel_addr, BMI088_ACCEL_X_LSB, accel, sizeof(accel)) == 0U) {
+        return 0U;
     }
 
-    ICM42688_ReadRegs(ICM42688_ACCEL_DATA_X1, acc, 6);
-    ICM42688_ReadRegs(ICM42688_GYRO_DATA_X1, gyro, 6);
+    /* Only this six-byte gyro I2C transfer is timed.  The displayed value
+     * intentionally excludes accel access, conversion, AHRS and OLED work. */
+    gyro_read_start = Systick_getTick();
+    if (BMI088_ReadRegs(bmi088_gyro_addr, BMI088_GYRO_X_LSB, gyro,
+                        sizeof(gyro)) == 0U) {
+        gyro_read_end = Systick_getTick();
+        bmi088_gyro_read_time_us = BMI088_TicksToUs(gyro_read_start,
+                                                     gyro_read_end);
+        return 0U;
+    }
+    gyro_read_end = Systick_getTick();
+    bmi088_gyro_read_time_us = BMI088_TicksToUs(gyro_read_start,
+                                                 gyro_read_end);
 
-    sample->ax = icm42688_acc_inv * (float)(int16_t)(((uint16_t)acc[0] << 8) | acc[1]);
-    sample->ay = icm42688_acc_inv * (float)(int16_t)(((uint16_t)acc[2] << 8) | acc[3]);
-    sample->az = icm42688_acc_inv * (float)(int16_t)(((uint16_t)acc[4] << 8) | acc[5]);
-    sample->gx = icm42688_gyro_inv * (float)(int16_t)(((uint16_t)gyro[0] << 8) | gyro[1]);
-    sample->gy = icm42688_gyro_inv * (float)(int16_t)(((uint16_t)gyro[2] << 8) | gyro[3]);
-    sample->gz = icm42688_gyro_inv * (float)(int16_t)(((uint16_t)gyro[4] << 8) | gyro[5]);
+    raw = (int16_t)((uint16_t)accel[1] << 8 | accel[0]);
+    sample->ax = (float)raw * BMI088_ACCEL_MG_PER_LSB;
+    raw = (int16_t)((uint16_t)accel[3] << 8 | accel[2]);
+    sample->ay = (float)raw * BMI088_ACCEL_MG_PER_LSB;
+    raw = (int16_t)((uint16_t)accel[5] << 8 | accel[4]);
+    sample->az = (float)raw * BMI088_ACCEL_MG_PER_LSB;
 
-    icm42688_acc_x = ax = sample->ax;
-    icm42688_acc_y = ay = sample->ay;
-    icm42688_acc_z = az = sample->az;
-    icm42688_gyro_x = gx = sample->gx;
-    icm42688_gyro_y = gy = sample->gy;
-    icm42688_gyro_z = gz = sample->gz;
+    raw = (int16_t)((uint16_t)gyro[1] << 8 | gyro[0]);
+    sample->gx = (float)raw * BMI088_GYRO_DPS_PER_LSB;
+    raw = (int16_t)((uint16_t)gyro[3] << 8 | gyro[2]);
+    sample->gy = (float)raw * BMI088_GYRO_DPS_PER_LSB;
+    raw = (int16_t)((uint16_t)gyro[5] << 8 | gyro[4]);
+    sample->gz = (float)raw * BMI088_GYRO_DPS_PER_LSB;
+    return 1U;
 }

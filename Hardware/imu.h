@@ -15,6 +15,7 @@ extern IMU_Data imu_data;
 bool IMU_InitAndCalibrate(void);
 bool IMU_Update(float dt, bool allow_bias_tracking);
 void IMU_Read(IMU_Data *data);
+uint8_t IMU_GetInitError(void);
 float IMU_GetGyroZBias(void);
 float IMU_GetGyroZ(void);
 float IMU_GetYawRate(void);

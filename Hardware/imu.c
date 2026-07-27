@@ -22,27 +22,37 @@ static float yaw_rate_dps;
 static uint16_t last_dt_ms;
 static uint32_t late_update_count;
 static bool imu_ready;
+/* 0:none, 1:BMI init, 2:discard read, 3:calibration read, 4:gravity invalid */
+static uint8_t imu_init_error;
 
 bool IMU_InitAndCalibrate(void)
 {
-    ICM42688_Sample_t sample;
+    BMI088_Sample_t sample;
     float sum_gx = 0.0f, sum_gy = 0.0f, sum_gz = 0.0f;
     float sum_ax = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
     float gravity_norm;
     uint32_t i;
 
     imu_ready = false;
-    if (ICM42688_Init() == 0U) {
+    imu_init_error = 0U;
+    if (BMI088_Init() == 0U) {
+        imu_init_error = 1U;
         return false;
     }
 
     for (i = 0U; i < IMU_CALIBRATION_DISCARD_COUNT; ++i) {
-        ICM42688_ReadSample(&sample);
+        if (BMI088_ReadSample(&sample) == 0U) {
+            imu_init_error = 2U;
+            return false;
+        }
         delay_ms(IMU_CALIBRATION_INTERVAL_MS);
     }
 
     for (i = 0U; i < IMU_CALIBRATION_SAMPLE_COUNT; ++i) {
-        ICM42688_ReadSample(&sample);
+        if (BMI088_ReadSample(&sample) == 0U) {
+            imu_init_error = 3U;
+            return false;
+        }
         sum_gx += sample.gx;
         sum_gy += sample.gy;
         sum_gz += sample.gz;
@@ -58,6 +68,7 @@ bool IMU_InitAndCalibrate(void)
 
     gravity_norm = sqrtf(sum_ax * sum_ax + sum_ay * sum_ay + sum_az * sum_az);
     if (gravity_norm < 1.0f) {
+        imu_init_error = 4U;
         return false;
     }
     yaw_axis_x = sum_ax / gravity_norm;
@@ -81,7 +92,7 @@ bool IMU_InitAndCalibrate(void)
 
 bool IMU_Update(float dt, bool allow_bias_tracking)
 {
-    ICM42688_Sample_t sample;
+    BMI088_Sample_t sample;
     float accel_norm_sq;
 
     if (!imu_ready || dt <= 0.0f) {
@@ -93,7 +104,9 @@ bool IMU_Update(float dt, bool allow_bias_tracking)
         ++late_update_count;
     }
 
-    ICM42688_ReadSample(&sample);
+    if (BMI088_ReadSample(&sample) == 0U) {
+        return false;
+    }
     imu_data.gx = sample.gx - gyro_bias_x;
     imu_data.gy = sample.gy - gyro_bias_y;
     imu_data.gz = sample.gz - gyro_bias_z;
@@ -111,7 +124,7 @@ bool IMU_Update(float dt, bool allow_bias_tracking)
     }
 
     /* Project the three sensor gyro axes onto the calibrated vertical axis.
-     * This remains valid when the ICM module is fixed but tilted on the car. */
+     * This remains valid when the BMI088 module is fixed but tilted on the car. */
     yaw_rate_dps = imu_data.gx * yaw_axis_x +
                    imu_data.gy * yaw_axis_y +
                    imu_data.gz * yaw_axis_z;
@@ -128,6 +141,7 @@ void IMU_Read(IMU_Data *data)
     }
 }
 
+uint8_t IMU_GetInitError(void)      { return imu_init_error; }
 float IMU_GetGyroZBias(void)       { return gyro_bias_z; }
 float IMU_GetGyroZ(void)           { return imu_data.gz; }
 float IMU_GetYawRate(void)          { return yaw_rate_dps; }

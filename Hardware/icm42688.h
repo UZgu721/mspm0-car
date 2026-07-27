@@ -1,97 +1,56 @@
-#ifndef _ICM42688_H
-#define _ICM42688_H
+#ifndef BMI088_H
+#define BMI088_H
+
+#include <stdint.h>
 #include "ti_msp_dl_config.h"
 
-/* I2C 地址 (AD0=0) */
-#define ICM42688_I2C_ADDR       (0x68)
+/*
+ * BMI088 I2C driver interface.
+ *
+ * The source file retains its historical name (icm42688.c) because CCS has
+ * already generated a make rule for that source file.  The implementation and
+ * all public symbols below are BMI088-only; no ICM42688 register is used.
+ */
 
-/* ── Bank 0 寄存器 ── */
-#define ICM42688_DEVICE_CONFIG      0x11
-#define ICM42688_DRIVE_CONFIG       0x13
-#define ICM42688_INT_CONFIG         0x14
-#define ICM42688_FIFO_CONFIG        0x16
-#define ICM42688_TEMP_DATA1         0x1D
-#define ICM42688_TEMP_DATA0         0x1E
-#define ICM42688_ACCEL_DATA_X1      0x1F
-#define ICM42688_ACCEL_DATA_X0      0x20
-#define ICM42688_ACCEL_DATA_Y1      0x21
-#define ICM42688_ACCEL_DATA_Y0      0x22
-#define ICM42688_ACCEL_DATA_Z1      0x23
-#define ICM42688_ACCEL_DATA_Z0      0x24
-#define ICM42688_GYRO_DATA_X1       0x25
-#define ICM42688_GYRO_DATA_X0       0x26
-#define ICM42688_GYRO_DATA_Y1       0x27
-#define ICM42688_GYRO_DATA_Y0       0x28
-#define ICM42688_GYRO_DATA_Z1       0x29
-#define ICM42688_GYRO_DATA_Z0       0x2A
-#define ICM42688_INT_STATUS         0x2D
-#define ICM42688_FIFO_COUNTH        0x2E
-#define ICM42688_FIFO_COUNTL        0x2F
-#define ICM42688_FIFO_DATA          0x30
-#define ICM42688_SIGNAL_PATH_RESET  0x4B
-#define ICM42688_INTF_CONFIG0       0x4C
-#define ICM42688_INTF_CONFIG1       0x4D
-#define ICM42688_PWR_MGMT0          0x4E
-#define ICM42688_GYRO_CONFIG0       0x4F
-#define ICM42688_ACCEL_CONFIG0      0x50
-#define ICM42688_GYRO_CONFIG1       0x51
-#define ICM42688_GYRO_ACCEL_CONFIG0 0x52
-#define ICM42688_ACCEL_CONFIG1      0x53
-#define ICM42688_FIFO_CONFIG1       0x5F
-#define ICM42688_FIFO_CONFIG2       0x60
-#define ICM42688_FIFO_CONFIG3       0x61
-#define ICM42688_INT_CONFIG0        0x63
-#define ICM42688_INT_CONFIG1        0x64
-#define ICM42688_INT_SOURCE0        0x65
-#define ICM42688_INT_SOURCE1        0x66
-#define ICM42688_WHO_AM_I           0x75
-#define ICM42688_REG_BANK_SEL       0x76
-
-/* WHO_AM_I 期望值 */
-#define ICM42688_WHO_AM_I_VAL       (0x47)
-
-/* ── 量程/ODR 枚举 ── */
-enum icm42688_afs {
-    ICM42688_AFS_16G = 0,
-    ICM42688_AFS_8G,
-    ICM42688_AFS_4G,
-    ICM42688_AFS_2G,
-};
-enum icm42688_gfs {
-    ICM42688_GFS_2000DPS = 0,
-    ICM42688_GFS_1000DPS,
-    ICM42688_GFS_500DPS,
-    ICM42688_GFS_250DPS,
-    ICM42688_GFS_125DPS,
-    ICM42688_GFS_62_5DPS,
-    ICM42688_GFS_31_25DPS,
-    ICM42688_GFS_15_625DPS,
-};
-enum icm42688_aodr {
-    ICM42688_AODR_1000HZ = 5,
-};
-enum icm42688_godr {
-    ICM42688_GODR_1000HZ = 5,
-};
-
-/* ── 全局变量（原始数据） ── */
-extern float icm42688_acc_x, icm42688_acc_y, icm42688_acc_z;
-extern float icm42688_gyro_x, icm42688_gyro_y, icm42688_gyro_z;
-extern float gx, gy, gz;
-extern float ax, ay, az;
+/* This board straps SDO1 and SDO2 high. These are the same secondary I2C
+ * addresses selected by the supplied Bosch BMI088 I2C example. */
+#define BMI088_ACCEL_ADDR              0x19U
+#define BMI088_GYRO_ADDR               0x69U
 
 typedef struct {
-    float gx, gy, gz;
-    float ax, ay, az;
-} ICM42688_Sample_t;
+    float gx;     /* dps */
+    float gy;     /* dps */
+    float gz;     /* dps */
+    float ax;     /* mg  */
+    float ay;     /* mg  */
+    float az;     /* mg  */
+} BMI088_Sample_t;
 
-/* ── API ── */
-uint8_t ICM42688_Init(void);   /* 返回1=成功, 0=失败 */
-void ICM42688_Read_Accel(void);
-void ICM42688_Read_Gyro(void);
-void ICM42688_Read_GyroZ(void);  /* 只读陀螺Z（快通道，2次I2C） */
-void ICM42688_ReadSample(ICM42688_Sample_t *sample);
-void ICM42688_Set_Range(enum icm42688_afs afs, enum icm42688_aodr aodr,
-                        enum icm42688_gfs gfs, enum icm42688_godr godr);
+/* Runtime diagnostic codes for the latest failed I2C/BMI088 operation. */
+#define BMI088_ERROR_NONE              0U
+#define BMI088_ERROR_IDLE_TIMEOUT      1U
+#define BMI088_ERROR_TRANSFER_TIMEOUT  2U
+#define BMI088_ERROR_I2C_NACK          3U
+#define BMI088_ERROR_ACCEL_NOT_FOUND   4U
+#define BMI088_ERROR_GYRO_NOT_FOUND    5U
+#define BMI088_ERROR_CONFIGURATION     6U
+
+/* Returns 1 only after both BMI088 chips are detected and configured. */
+uint8_t BMI088_Init(void);
+
+/* Reads each chip's contiguous XYZ register block in one I2C transaction. */
+uint8_t BMI088_ReadSample(BMI088_Sample_t *sample);
+
+uint8_t BMI088_GetLastError(void);
+uint8_t BMI088_GetInitStage(void);
+uint32_t BMI088_GetGyroReadTimeUs(void);
+
+/* Reads register 0x00 from both devices without applying configuration.
+ * Return bit0: accelerometer CHIP_ID read successfully; bit1: gyroscope. */
+uint8_t BMI088_ReadRawIds(uint8_t *accel_id, uint8_t *gyro_id);
+
+/* One-shot diagnostic: scans legal 7-bit I2C addresses and stores each
+ * address that acknowledges a single-byte read. */
+uint8_t BMI088_ScanI2C(uint8_t *addresses, uint8_t max_addresses);
 
 #endif
