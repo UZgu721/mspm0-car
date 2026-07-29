@@ -77,6 +77,7 @@ GPIO5.associatedPins[0].assignedPin  = "9";
 GPIO6.$name                          = "KEY";
 GPIO6.associatedPins[0].$name        = "key_0";
 GPIO6.associatedPins[0].direction    = "INPUT";
+GPIO6.associatedPins[0].internalResistor = "PULL_UP";
 GPIO6.associatedPins[0].assignedPort = "PORTB";
 GPIO6.associatedPins[0].assignedPin  = "8";
 
@@ -204,6 +205,10 @@ UART1.$name                            = "UART_1";
 UART1.peripheral.$assign               = "UART1";
 UART1.peripheral.rxPin.$assign         = "PB7";
 UART1.peripheral.txPin.$assign         = "PB6";
+/* Bluetooth RX must keep running while the foreground refreshes the OLED. */
+UART1.enableFIFO                        = true;
+UART1.rxFifoThreshold                   = "DL_UART_RX_FIFO_LEVEL_ONE_ENTRY";
+UART1.enabledInterrupts                 = ["RX"];
 
 /* ── UART2: 备用串口 (PB16=RX, PB17=TX) ── */
 UART2.$name                            = "UART_2";

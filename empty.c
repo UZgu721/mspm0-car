@@ -54,6 +54,192 @@ extern uint8_t turn_count;
 extern uint8_t lap_count;
 extern uint8_t target_lap;
 
+/* UART1 / HC-05 bilateral protocol: <Y:+012.3>
+ * Each node periodically sends its own yaw and uses the same parser to save
+ * the peer yaw.  Incoming data is diagnostic-only and never drives motors. */
+#define BLUETOOTH_YAW_PERIOD_TICKS  100U /* 1 s */
+#define BLUETOOTH_PEER_TIMEOUT_TICKS 500U /* 5 s */
+#define BLUETOOTH_YAW_BODY_LENGTH   8U
+#define BLUETOOTH_RX_PACKET_LENGTH   18U
+#define BLUETOOTH_RX_QUEUE_SIZE      32U
+#define BLUETOOTH_RX_QUEUE_MASK      (BLUETOOTH_RX_QUEUE_SIZE - 1U)
+
+static uint8_t bluetooth_rx_body[BLUETOOTH_YAW_BODY_LENGTH];
+static uint8_t bluetooth_rx_length;
+static uint8_t bluetooth_receiving;
+/* Raw packet monitor: accepts ordinary phone serial-assistant text too. */
+static uint8_t bluetooth_rx_packet[BLUETOOTH_RX_PACKET_LENGTH + 1U] = "---";
+static uint8_t bluetooth_rx_packet_length;
+static uint8_t bluetooth_rx_packet_complete;
+static float bluetooth_peer_yaw;
+static uint8_t bluetooth_peer_yaw_valid;
+static uint32_t bluetooth_peer_tick;
+static uint32_t bluetooth_last_tx_tick;
+static uint8_t bluetooth_tx_frame[10];
+static uint8_t bluetooth_tx_index;
+static uint8_t bluetooth_tx_length;
+/* UART ISR writes this queue; foreground code alone parses the frame. */
+static volatile uint8_t bluetooth_rx_queue[BLUETOOTH_RX_QUEUE_SIZE];
+static volatile uint8_t bluetooth_rx_write_index;
+static volatile uint8_t bluetooth_rx_read_index;
+static volatile uint16_t bluetooth_rx_overflow_count;
+static volatile uint16_t bluetooth_uart_irq_count;
+static volatile uint16_t bluetooth_uart_byte_count;
+
+static void Bluetooth_ParseYawFrame(void)
+{
+    uint32_t magnitude;
+
+    if ((bluetooth_rx_length != BLUETOOTH_YAW_BODY_LENGTH) ||
+        (bluetooth_rx_body[0] != 'Y') ||
+        (bluetooth_rx_body[1] != ':') ||
+        ((bluetooth_rx_body[2] != '+') && (bluetooth_rx_body[2] != '-')) ||
+        (bluetooth_rx_body[6] != '.') ||
+        (bluetooth_rx_body[3] < '0') || (bluetooth_rx_body[3] > '9') ||
+        (bluetooth_rx_body[4] < '0') || (bluetooth_rx_body[4] > '9') ||
+        (bluetooth_rx_body[5] < '0') || (bluetooth_rx_body[5] > '9') ||
+        (bluetooth_rx_body[7] < '0') || (bluetooth_rx_body[7] > '9')) {
+        return;
+    }
+
+    magnitude = (uint32_t)(bluetooth_rx_body[3] - '0') * 1000U +
+                (uint32_t)(bluetooth_rx_body[4] - '0') * 100U +
+                (uint32_t)(bluetooth_rx_body[5] - '0') * 10U +
+                (uint32_t)(bluetooth_rx_body[7] - '0');
+    bluetooth_peer_yaw = (float)magnitude * 0.1f;
+    if (bluetooth_rx_body[2] == '-') {
+        bluetooth_peer_yaw = -bluetooth_peer_yaw;
+    }
+    bluetooth_peer_yaw_valid = 1U;
+    bluetooth_peer_tick = sys_10ms_tick;
+}
+
+static void Bluetooth_HandleByte(uint8_t byte)
+{
+    if (byte == '<') {
+        bluetooth_rx_length = 0U;
+        bluetooth_receiving = 1U;
+    } else if (byte == '>') {
+        if (bluetooth_receiving != 0U) {
+            Bluetooth_ParseYawFrame();
+        }
+        bluetooth_rx_length = 0U;
+        bluetooth_receiving = 0U;
+    } else if (bluetooth_receiving != 0U) {
+        if (bluetooth_rx_length < sizeof(bluetooth_rx_body)) {
+            bluetooth_rx_body[bluetooth_rx_length++] = byte;
+        } else {
+            /* Oversize/noisy frame: discard it and wait for the next '<'. */
+            bluetooth_rx_length = 0U;
+            bluetooth_receiving = 0U;
+        }
+    }
+}
+
+/* Store every printable byte independently of the yaw-frame parser.
+ * A '<' starts a new framed message; CR/LF terminates ordinary text. */
+static void Bluetooth_StoreRawByte(uint8_t byte)
+{
+    if (byte == '<') {
+        bluetooth_rx_packet_length = 0U;
+        bluetooth_rx_packet[0] = '\0';
+        bluetooth_rx_packet_complete = 0U;
+    }
+
+    if ((byte == '\r') || (byte == '\n')) {
+        if (bluetooth_rx_packet_length != 0U) {
+            bluetooth_rx_packet_complete = 1U;
+        }
+        return;
+    }
+
+    if ((byte >= 0x20U) && (byte <= 0x7EU) &&
+        (bluetooth_rx_packet_length < BLUETOOTH_RX_PACKET_LENGTH)) {
+        if (bluetooth_rx_packet_complete != 0U) {
+            bluetooth_rx_packet_length = 0U;
+            bluetooth_rx_packet[0] = '\0';
+            bluetooth_rx_packet_complete = 0U;
+        }
+        bluetooth_rx_packet[bluetooth_rx_packet_length++] = byte;
+        bluetooth_rx_packet[bluetooth_rx_packet_length] = '\0';
+    }
+}
+
+static void Bluetooth_QueueYaw(float yaw)
+{
+    uint32_t magnitude;
+
+    magnitude = (uint32_t)((yaw < 0.0f ? -yaw : yaw) * 10.0f + 0.5f);
+    if (magnitude > 9999U) {
+        magnitude = 9999U;
+    }
+
+    bluetooth_tx_frame[0] = '<';
+    bluetooth_tx_frame[1] = 'Y';
+    bluetooth_tx_frame[2] = ':';
+    bluetooth_tx_frame[3] = (yaw < 0.0f) ? '-' : '+';
+    bluetooth_tx_frame[4] = (uint8_t)('0' + (magnitude / 1000U));
+    bluetooth_tx_frame[5] = (uint8_t)('0' + (magnitude / 100U) % 10U);
+    bluetooth_tx_frame[6] = (uint8_t)('0' + (magnitude / 10U) % 10U);
+    bluetooth_tx_frame[7] = '.';
+    bluetooth_tx_frame[8] = (uint8_t)('0' + magnitude % 10U);
+    bluetooth_tx_frame[9] = '>';
+    bluetooth_tx_index = 0U;
+    bluetooth_tx_length = sizeof(bluetooth_tx_frame);
+}
+
+static void Bluetooth_Task(void)
+{
+    uint32_t now = sys_10ms_tick;
+    uint8_t byte;
+
+    while (bluetooth_rx_read_index != bluetooth_rx_write_index) {
+        byte = bluetooth_rx_queue[bluetooth_rx_read_index];
+        bluetooth_rx_read_index =
+            (bluetooth_rx_read_index + 1U) & BLUETOOTH_RX_QUEUE_MASK;
+        Bluetooth_StoreRawByte(byte);
+        Bluetooth_HandleByte(byte);
+    }
+
+    /* Advance the TX frame only after the peripheral reports space. */
+    if (bluetooth_tx_index < bluetooth_tx_length) {
+        if (DL_UART_Main_isTXFIFOFull(UART_1_INST) == false) {
+            DL_UART_Main_transmitData(UART_1_INST,
+                                      bluetooth_tx_frame[bluetooth_tx_index]);
+            ++bluetooth_tx_index;
+        }
+        return;
+    }
+
+    if ((bmi_ok != 0U) &&
+        ((uint32_t)(now - bluetooth_last_tx_tick) >= BLUETOOTH_YAW_PERIOD_TICKS)) {
+        bluetooth_last_tx_tick = now;
+        Bluetooth_QueueYaw(AHRS_GetYaw());
+    }
+}
+
+static uint8_t Bluetooth_HasFreshPeerYaw(void)
+{
+    return (bluetooth_peer_yaw_valid != 0U) &&
+           ((uint32_t)(sys_10ms_tick - bluetooth_peer_tick) <=
+            BLUETOOTH_PEER_TIMEOUT_TICKS);
+}
+
+static void OLED_ShowBluetoothReceive(void)
+{
+    OLED_ShowString(0, 48, (uint8_t *)"RX:");
+
+    if (bluetooth_rx_packet_length != 0U) {
+        OLED_ShowString(18, 48, bluetooth_rx_packet);
+    } else {
+        OLED_ShowString(18, 48, (uint8_t *)"---");
+        OLED_ShowString(42, 48, (uint8_t *)"I:");
+        OLED_ShowNumber(54, 48, bluetooth_uart_irq_count % 100U, 2, 12);
+        OLED_ShowString(72, 48, (uint8_t *)"B:");
+        OLED_ShowNumber(84, 48, bluetooth_uart_byte_count % 100U, 2, 12);
+    }
+}
+
 static void OLED_ShowFixed(uint8_t x, uint8_t y, float value,
                            uint8_t integer_digits, uint8_t fraction_digits)
 {
@@ -105,9 +291,7 @@ static void OLED_DrawDebugPage(void)
     OLED_ShowString(48, 32, (uint8_t *)"CAL:");
     OLED_ShowString(80, 32, (uint8_t *)(IMU_IsCalibrated() ? "OK" : "--"));
 
-    OLED_ShowString(0, 48, (uint8_t *)"RD:");
-    OLED_ShowNumber(24, 48, BMI088_GetGyroReadTimeUs(), 4, 12);
-    OLED_ShowString(48, 48, (uint8_t *)"us");
+    OLED_ShowBluetoothReceive();
 }
 
 int main(void)
@@ -131,6 +315,8 @@ int main(void)
     NVIC_EnableIRQ(ENCODERB_INT_IRQN);
     NVIC_ClearPendingIRQ(TIMER_0_INST_INT_IRQN);
     NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(UART_1_INST_INT_IRQN);
+    NVIC_EnableIRQ(UART_1_INST_INT_IRQN);
 
     OLED_Init();
 
@@ -193,6 +379,8 @@ int main(void)
                 bmi_last_tick = now;
             }
         }
+
+        Bluetooth_Task();
 
         memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
 
@@ -263,11 +451,7 @@ int main(void)
         }  /* end of bmi_ok/bmi_attempted static block */
 
         /* 第4行：目标圈数 */
-        OLED_ShowString(0, 48, (uint8_t *)"LAP:");
-        OLED_ShowNumber(30, 48, target_lap, 2, 12);
-        OLED_ShowString(48, 48, (uint8_t *)"RD:");
-        OLED_ShowNumber(66, 48, BMI088_GetGyroReadTimeUs(), 4, 12);
-        OLED_ShowString(90, 48, (uint8_t *)"us");
+        OLED_ShowBluetoothReceive();
 
         if (oled_debug_page != 0U) {
             OLED_DrawDebugPage();
@@ -314,5 +498,30 @@ void TIMG0_IRQHandler(void)
             oled_debug_page ^= 1U;
             bkeys[1].double_flag = 0;
         }
+    }
+}
+
+/* Keep the ISR short: empty the hardware FIFO into a software queue.  Frame
+ * parsing stays in the foreground, so it cannot interfere with control ISR. */
+void UART1_IRQHandler(void)
+{
+    uint8_t next_write_index;
+
+    ++bluetooth_uart_irq_count;
+    (void)DL_UART_getPendingInterrupt(UART_1_INST);
+
+    while (DL_UART_Main_isRXFIFOEmpty(UART_1_INST) == false) {
+        next_write_index =
+            (bluetooth_rx_write_index + 1U) & BLUETOOTH_RX_QUEUE_MASK;
+
+        if (next_write_index != bluetooth_rx_read_index) {
+            bluetooth_rx_queue[bluetooth_rx_write_index] =
+                DL_UART_Main_receiveData(UART_1_INST);
+            bluetooth_rx_write_index = next_write_index;
+        } else {
+            (void)DL_UART_Main_receiveData(UART_1_INST);
+            ++bluetooth_rx_overflow_count;
+        }
+        ++bluetooth_uart_byte_count;
     }
 }
