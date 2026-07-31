@@ -1,135 +1,250 @@
 /*
  * Copyright (c) 2021, Texas Instruments Incorporated
  * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * *  Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *
- * *  Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * *  Neither the name of Texas Instruments Incorporated nor the names of
- *    its contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
- * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #include "board.h"
 #include "ti_msp_dl_config.h"
-#include "KEY.h"
 #include "motor.h"
 #include "encoder.h"
 #include "pid.h"
 #include "huidu.h"
-#include "adc_dma.h"
 
 uint8_t i = 0;
-extern struct Bkeys bkeys[3];
 int32_t vel_left = 0, vel_right = 0;
 uint8_t time_40ms = 0;
 extern PID_t motorA, motorB;
 uint8_t pid_flag = 0, huidu_pid_flag = 0;
-extern uint8_t turn_count;
-extern uint8_t lap_count;
-extern uint8_t target_lap;
+volatile uint32_t sys_10ms_tick = 0;
+
+#define RUN_TIMER_STOP_CONFIRM_TICKS 50U
+
+typedef enum {
+    RUN_TIMER_IDLE = 0,
+    RUN_TIMER_RUNNING,
+    RUN_TIMER_STOPPED
+} RunTimerState;
+
+static volatile RunTimerState run_timer_state = RUN_TIMER_IDLE;
+static volatile uint32_t run_timer_ticks;
+static volatile uint32_t run_timer_last_motion_ticks;
+static volatile uint8_t run_timer_motion_seen;
+static volatile uint8_t run_timer_still_ticks;
+
+/* UART1 receives Bluetooth/serial text on PB7. RX is independent from the
+ * control loop and no attitude data is transmitted. */
+#define BLUETOOTH_RX_PACKET_LENGTH 18U
+#define BLUETOOTH_RX_QUEUE_SIZE    32U
+#define BLUETOOTH_RX_QUEUE_MASK    (BLUETOOTH_RX_QUEUE_SIZE - 1U)
+
+static uint8_t bluetooth_rx_packet[BLUETOOTH_RX_PACKET_LENGTH + 1U] = "---";
+static uint8_t bluetooth_rx_packet_length;
+static uint8_t bluetooth_rx_packet_complete;
+static volatile uint8_t bluetooth_rx_queue[BLUETOOTH_RX_QUEUE_SIZE];
+static volatile uint8_t bluetooth_rx_write_index;
+static volatile uint8_t bluetooth_rx_read_index;
+static volatile uint16_t bluetooth_rx_overflow_count;
+static volatile uint16_t bluetooth_uart_irq_count;
+static volatile uint16_t bluetooth_uart_byte_count;
+
+static uint32_t RunTimer_GetSeconds(void)
+{
+    return run_timer_ticks / 100U;
+}
+
+static void RunTimer_Start(void)
+{
+    run_timer_state = RUN_TIMER_RUNNING;
+    run_timer_ticks = 0U;
+    run_timer_last_motion_ticks = 0U;
+    run_timer_motion_seen = 0U;
+    run_timer_still_ticks = 0U;
+}
+
+/* A software stop (finish marker) freezes immediately. If the car becomes
+ * physically stuck while still commanded to run, the encoder-based 500 ms
+ * no-pulse rule remains as a fallback. */
+static void RunTimer_Task(void)
+{
+    if (run_timer_state != RUN_TIMER_RUNNING) {
+        return;
+    }
+
+    if (huidu_pid_flag == 0U) {
+        run_timer_state = RUN_TIMER_STOPPED;
+        return;
+    }
+
+    ++run_timer_ticks;
+
+    if ((vel_left != 0) || (vel_right != 0)) {
+        run_timer_motion_seen = 1U;
+        run_timer_still_ticks = 0U;
+        run_timer_last_motion_ticks = run_timer_ticks;
+    } else if (run_timer_motion_seen != 0U) {
+        if (run_timer_still_ticks < RUN_TIMER_STOP_CONFIRM_TICKS) {
+            ++run_timer_still_ticks;
+        }
+        if (run_timer_still_ticks >= RUN_TIMER_STOP_CONFIRM_TICKS) {
+            run_timer_ticks = run_timer_last_motion_ticks;
+            run_timer_state = RUN_TIMER_STOPPED;
+        }
+    }
+}
+
+/* PB8 is active-low. Only a release after at least 700 ms starts following. */
+static void Key_ServiceLongPress(void)
+{
+    static uint8_t pressed_ticks = 0U;
+
+    if (DL_GPIO_readPins(GPIOB, DL_GPIO_PIN_8) == 0U) {
+        if (pressed_ticks < 255U) {
+            ++pressed_ticks;
+        }
+    } else if (pressed_ticks != 0U) {
+        if (pressed_ticks > 69U) {
+            huidu_pid_flag = 1U;
+            if (run_timer_state != RUN_TIMER_RUNNING) {
+                RunTimer_Start();
+            }
+        }
+        pressed_ticks = 0U;
+    }
+}
+
+/* A '<' starts a new framed message; CR/LF terminates ordinary text. */
+static void Bluetooth_StoreRawByte(uint8_t byte)
+{
+    if (byte == '<') {
+        bluetooth_rx_packet_length = 0U;
+        bluetooth_rx_packet[0] = '\0';
+        bluetooth_rx_packet_complete = 0U;
+    }
+
+    if ((byte == '\r') || (byte == '\n')) {
+        if (bluetooth_rx_packet_length != 0U) {
+            bluetooth_rx_packet_complete = 1U;
+        }
+        return;
+    }
+
+    if ((byte >= 0x20U) && (byte <= 0x7EU) &&
+        (bluetooth_rx_packet_length < BLUETOOTH_RX_PACKET_LENGTH)) {
+        if (bluetooth_rx_packet_complete != 0U) {
+            bluetooth_rx_packet_length = 0U;
+            bluetooth_rx_packet[0] = '\0';
+            bluetooth_rx_packet_complete = 0U;
+        }
+        bluetooth_rx_packet[bluetooth_rx_packet_length++] = byte;
+        bluetooth_rx_packet[bluetooth_rx_packet_length] = '\0';
+    }
+}
+
+static void Bluetooth_Task(void)
+{
+    uint8_t byte;
+
+    while (bluetooth_rx_read_index != bluetooth_rx_write_index) {
+        byte = bluetooth_rx_queue[bluetooth_rx_read_index];
+        bluetooth_rx_read_index =
+            (bluetooth_rx_read_index + 1U) & BLUETOOTH_RX_QUEUE_MASK;
+        Bluetooth_StoreRawByte(byte);
+    }
+}
 
 int main(void)
 {
     SYSCFG_DL_init();
+
     Encoder_Init();
-
-    /* 灰度传感器校准初始化 */
-    Huidu_Sensor_Init();
-
-    /* 启动ADC连续转换（repeat模式） */
-    DL_ADC12_startConversion(ADC12_0_INST);
-
     NVIC_ClearPendingIRQ(ENCODERA_INT_IRQN);
     NVIC_EnableIRQ(ENCODERA_INT_IRQN);
     NVIC_ClearPendingIRQ(ENCODERB_INT_IRQN);
     NVIC_EnableIRQ(ENCODERB_INT_IRQN);
     NVIC_ClearPendingIRQ(TIMER_0_INST_INT_IRQN);
     NVIC_EnableIRQ(TIMER_0_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(UART_1_INST_INT_IRQN);
+    NVIC_EnableIRQ(UART_1_INST_INT_IRQN);
 
     OLED_Init();
 
     while (1) {
-        /* 开机自动校准（放在白底上），完成后自动进入正常显示 */
-        if (!Huidu_AutoCalibrate()) {
-            memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
-            OLED_ShowString(20, 24, (uint8_t *)"CALIB...");
-            OLED_Refresh_Gram();
-            continue;
-        }
-
-        /* 灰度传感器持续采集（ADC+DMA，在后台更新） */
-        Huidu_Sensor_Task();
+        Bluetooth_Task();
 
         memset(OLED_GRAM, 0, 128 * 8 * sizeof(u8));
 
-        /* 第1行：左右轮转速（10ms编码器脉冲增量） */
         OLED_ShowString(0, 0, (uint8_t *)"L:");
         OLED_ShowSignedNum(12, 0, vel_left, 6, 12);
         OLED_ShowString(54, 0, (uint8_t *)"R:");
         OLED_ShowSignedNum(66, 0, vel_right, 6, 12);
 
-        /* 第2行：8路灰度状态 bit7..bit0 */
         {
             uint8_t g = Read_HuiDu();
             uint8_t buf[12];
-            buf[0] = 'G'; buf[1] = ':';
-            for (int i = 0; i < 8; i++)
-                buf[2 + i] = (g & (0x80 >> i)) ? '1' : '0';
+
+            buf[0] = 'G';
+            buf[1] = ':';
+            for (int index = 0; index < 8; ++index) {
+                buf[2 + index] = (g & (1U << index)) ? '1' : '0';
+            }
             buf[10] = '\0';
             OLED_ShowString(0, 16, buf);
         }
 
-        /* 第4行：目标圈数 */
-        OLED_ShowString(0, 48, (uint8_t *)"LAP:");
-        OLED_ShowNumber(30, 48, target_lap, 2, 12);
+        OLED_ShowString(0, 32, (uint8_t *)"RUN:");
+        OLED_ShowString(30, 32,
+                        (uint8_t *)(huidu_pid_flag != 0U ? "ON" : "WAIT"));
+        OLED_ShowString(0, 48, (uint8_t *)"T:");
+        OLED_ShowNumber(12, 48, RunTimer_GetSeconds(), 5, 12);
+        OLED_ShowString(42, 48, (uint8_t *)"s");
 
-        OLED_Refresh_Gram();
+        {
+            static uint32_t last_oled_tick = 0U;
+            uint32_t now = sys_10ms_tick;
+
+            if ((uint32_t)(now - last_oled_tick) >= 10U) {
+                last_oled_tick = now;
+                OLED_Refresh_Gram();
+            }
+        }
     }
 }
 
-/* 10ms定时中断 */
+/* 10 ms timer interrupt */
 void TIMG0_IRQHandler(void)
 {
     if (DL_TimerG_getPendingInterrupt(TIMER_0_INST) == DL_TIMER_IIDX_LOAD) {
-
-        vel_left  = Get_encoder_left();
+        sys_10ms_tick++;
+        vel_left = Get_encoder_left();
         vel_right = Get_encoder_right();
 
-        if (huidu_pid_flag == 1) {
+        if (huidu_pid_flag == 1U) {
             HuiDu_PID();
         }
-        key_serv_double();
+        Key_ServiceLongPress();
+        RunTimer_Task();
+    }
+}
 
-        if (bkeys[1].short_flag == 1) {
-            target_lap++;
-            if (target_lap > 5) {
-                target_lap = 0;
-            }
-            bkeys[1].short_flag = 0;
+/* Keep the ISR short: empty the hardware FIFO into a software queue. */
+void UART1_IRQHandler(void)
+{
+    uint8_t next_write_index;
+
+    ++bluetooth_uart_irq_count;
+    (void)DL_UART_getPendingInterrupt(UART_1_INST);
+
+    while (DL_UART_Main_isRXFIFOEmpty(UART_1_INST) == false) {
+        next_write_index =
+            (bluetooth_rx_write_index + 1U) & BLUETOOTH_RX_QUEUE_MASK;
+
+        if (next_write_index != bluetooth_rx_read_index) {
+            bluetooth_rx_queue[bluetooth_rx_write_index] =
+                DL_UART_Main_receiveData(UART_1_INST);
+            bluetooth_rx_write_index = next_write_index;
+        } else {
+            (void)DL_UART_Main_receiveData(UART_1_INST);
+            ++bluetooth_rx_overflow_count;
         }
-        if (bkeys[1].long_flag == 1) {
-            huidu_pid_flag = 1;
-            bkeys[1].long_flag = 0;
-        }
+        ++bluetooth_uart_byte_count;
     }
 }

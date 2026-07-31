@@ -15,4 +15,5 @@ targetConfigs/
 *.ccxml
 *.html
 *.md
+!Project_Readme.md
 Event.dot

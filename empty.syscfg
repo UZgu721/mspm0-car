@@ -20,11 +20,6 @@ const GPIO8   = GPIO.addInstance();
 const GPIO9   = GPIO.addInstance();
 const GPIO10  = GPIO.addInstance();
 const GPIO11  = GPIO.addInstance();
-const ADC12   = scripting.addModule("/ti/driverlib/ADC12", {}, false);
-const ADC121  = ADC12.addInstance();
-const DMA     = scripting.addModule("/ti/driverlib/DMA", {}, false);
-const I2C     = scripting.addModule("/ti/driverlib/I2C", {}, false);
-const I2C1    = I2C.addInstance();
 const PWM     = scripting.addModule("/ti/driverlib/PWM", {}, false);
 const PWM1    = PWM.addInstance();
 const SYSCTL  = scripting.addModule("/ti/driverlib/SYSCTL");
@@ -77,6 +72,7 @@ GPIO5.associatedPins[0].assignedPin  = "9";
 GPIO6.$name                          = "KEY";
 GPIO6.associatedPins[0].$name        = "key_0";
 GPIO6.associatedPins[0].direction    = "INPUT";
+GPIO6.associatedPins[0].internalResistor = "PULL_UP";
 GPIO6.associatedPins[0].assignedPort = "PORTB";
 GPIO6.associatedPins[0].assignedPin  = "8";
 
@@ -132,41 +128,33 @@ GPIO10.associatedPins[1].polarity          = "RISE";
 GPIO10.associatedPins[1].interruptPriority = "0";
 GPIO10.associatedPins[1].$name             = "E2B";
 
-/* ── ADC+DMA 灰度传感器（CD4051 8:1 mux, PA27=ADC输入） ── */
-ADC121.$name                             = "ADC12_0";
-ADC121.sampleTime0                       = "2 us";
-ADC121.sampClkDiv                        = "DL_ADC12_CLOCK_DIVIDE_8";
-ADC121.adcMem0_name                      = "ADC_CH0";
-ADC121.repeatMode                        = true;
-ADC121.configureDMA                      = true;
-ADC121.sampClkSrc                        = "DL_ADC12_CLOCK_ULPCLK";
-ADC121.sampCnt                           = 1;
-ADC121.enabledDMATriggers                = ["DL_ADC12_DMA_MEM0_RESULT_LOADED"];
-ADC121.peripheral.$assign                = "ADC0";
-ADC121.peripheral.adcPin0.$assign        = "PA27";
-ADC121.DMA_CHANNEL.$name                 = "DMA_CH0";
-ADC121.DMA_CHANNEL.srcLength             = "HALF_WORD";
-ADC121.DMA_CHANNEL.dstLength             = "HALF_WORD";
-ADC121.DMA_CHANNEL.addressMode           = "f2b";
-ADC121.DMA_CHANNEL.configureTransferSize = true;
-ADC121.DMA_CHANNEL.transferSize          = 40;
-ADC121.DMA_CHANNEL.transferMode          = "FULL_CH_REPEAT_SINGLE";
-
-/* ── CD4051 地址线 GPIO ── */
-GPIO11.$name                         = "Gray_Address";
-GPIO11.associatedPins.create(3);
-GPIO11.associatedPins[0].$name       = "PIN_0";
-GPIO11.associatedPins[0].pin.$assign = "PA22";
-GPIO11.associatedPins[1].$name       = "PIN_1";
-GPIO11.associatedPins[1].pin.$assign = "PA7";
-GPIO11.associatedPins[2].$name       = "PIN_2";
-GPIO11.associatedPins[2].pin.$assign = "PA24";
-
-/* ── I2C0: ICM42688 陀螺仪 (PA0=SDA, PA1=SCL) ── */
-I2C1.$name                      = "I2C_0";
-I2C1.peripheral.$assign         = "I2C0";
-I2C1.peripheral.sdaPin.$assign  = "PA0";
-I2C1.peripheral.sclPin.$assign  = "PA1";
+/* ── 8 路数字灰度输入：左至右 G0..G7，白=高、黑=低 ── */
+GPIO11.$name                          = "Gray_Input";
+GPIO11.associatedPins.create(8);
+GPIO11.associatedPins[0].$name        = "G0_LEFT";
+GPIO11.associatedPins[0].direction    = "INPUT";
+GPIO11.associatedPins[0].pin.$assign  = "PA12";
+GPIO11.associatedPins[1].$name        = "G1";
+GPIO11.associatedPins[1].direction    = "INPUT";
+GPIO11.associatedPins[1].pin.$assign  = "PA8";
+GPIO11.associatedPins[2].$name        = "G2";
+GPIO11.associatedPins[2].direction    = "INPUT";
+GPIO11.associatedPins[2].pin.$assign  = "PA9";
+GPIO11.associatedPins[3].$name        = "G3";
+GPIO11.associatedPins[3].direction    = "INPUT";
+GPIO11.associatedPins[3].pin.$assign  = "PA27";
+GPIO11.associatedPins[4].$name        = "G4";
+GPIO11.associatedPins[4].direction    = "INPUT";
+GPIO11.associatedPins[4].pin.$assign  = "PA24";
+GPIO11.associatedPins[5].$name        = "G5";
+GPIO11.associatedPins[5].direction    = "INPUT";
+GPIO11.associatedPins[5].pin.$assign  = "PA7";
+GPIO11.associatedPins[6].$name        = "G6";
+GPIO11.associatedPins[6].direction    = "INPUT";
+GPIO11.associatedPins[6].pin.$assign  = "PA22";
+GPIO11.associatedPins[7].$name        = "G7_RIGHT";
+GPIO11.associatedPins[7].direction    = "INPUT";
+GPIO11.associatedPins[7].pin.$assign  = "PA15";
 
 PWM1.$name                      = "PWM_0";
 PWM1.pwmMode                    = "EDGE_ALIGN_UP";
@@ -202,6 +190,10 @@ UART1.$name                            = "UART_1";
 UART1.peripheral.$assign               = "UART1";
 UART1.peripheral.rxPin.$assign         = "PB7";
 UART1.peripheral.txPin.$assign         = "PB6";
+/* Bluetooth RX must keep running while the foreground refreshes the OLED. */
+UART1.enableFIFO                        = true;
+UART1.rxFifoThreshold                   = "DL_UART_RX_FIFO_LEVEL_ONE_ENTRY";
+UART1.enabledInterrupts                 = ["RX"];
 
 /* ── UART2: 备用串口 (PB16=RX, PB17=TX) ── */
 UART2.$name                            = "UART_2";
@@ -227,7 +219,11 @@ GPIO9.associatedPins[0].pin.$suggestSolution  = "PA25";
 GPIO9.associatedPins[1].pin.$suggestSolution  = "PA26";
 GPIO10.associatedPins[0].pin.$suggestSolution = "PB20";
 GPIO10.associatedPins[1].pin.$suggestSolution = "PB24";
-GPIO11.associatedPins[0].pin.$suggestSolution  = "PA22";
-GPIO11.associatedPins[1].pin.$suggestSolution  = "PA7";
-GPIO11.associatedPins[2].pin.$suggestSolution  = "PA24";
-ADC121.DMA_CHANNEL.peripheral.$suggestSolution = "DMA_CH0";
+GPIO11.associatedPins[0].pin.$suggestSolution = "PA12";
+GPIO11.associatedPins[1].pin.$suggestSolution = "PA8";
+GPIO11.associatedPins[2].pin.$suggestSolution = "PA9";
+GPIO11.associatedPins[3].pin.$suggestSolution = "PA27";
+GPIO11.associatedPins[4].pin.$suggestSolution = "PA24";
+GPIO11.associatedPins[5].pin.$suggestSolution = "PA7";
+GPIO11.associatedPins[6].pin.$suggestSolution = "PA22";
+GPIO11.associatedPins[7].pin.$suggestSolution = "PA15";
